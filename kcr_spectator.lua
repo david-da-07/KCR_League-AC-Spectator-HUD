@@ -23,7 +23,7 @@ local CONFIG = {
   hudSlots = { 22 },            -- slots en los que se dibuja el HUD.         Ej: { 21 }
   hiddenSlots = { 22 },         -- slots que NO salen en la torre de tiempos.  Ej: { 21 }
   safetyCarSlots = { 20, 21 },  -- slot(s) del Safety Car: no salen en la torre y activan el estado SC
-  debugSlots = false,       -- true: dibuja un panel con tu slot y el de cada coche (para comprobar)
+  debugSlots = true,       -- true: dibuja un panel con tu slot y el de cada coche (para comprobar)
 
   -- Estado de pista
   stoppedSeconds = 3,              -- un coche parado en pista tanto tiempo => amarilla en su sector
