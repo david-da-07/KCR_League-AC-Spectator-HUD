@@ -33,6 +33,9 @@ local CONFIG = {
   nameFormat = 'surname',        -- 'surname' | 'tla' (3 letras) | 'full'
   keyToggleMode = 'F9',
   keyToggleHud = 'F10',
+  clickToFocus = true,          -- clic en una fila de la torre => seguir a ese piloto
+  keyPrevCar = 'PageUp',        -- coche anterior de la torre (alternativa si no hay cursor)
+  keyNextCar = 'PageDown',      -- coche siguiente de la torre
 
   maxRows = 24,
   checkpoints = 300,             -- resolucion del calculo de gaps (por vuelta)
@@ -732,6 +735,7 @@ local function drawTower(rows, kind, sim, laps, timed, sess, u, focusIdx, trackL
   local x0, y0 = 24 * u, 60 * u
   local W, headH, rowH = 410 * u, 38 * u, 30 * u
   local count = math.min(#rows, CONFIG.maxRows)
+  S.hit = {}   -- rectangulos clicables de esta frame (lo usa handleFocusInput)
 
   -- cabecera
   ui.drawRectFilled(vec2(x0, y0), vec2(x0 + W, y0 + headH), COL.bgHead(), 4 * u, 3)
@@ -758,8 +762,11 @@ local function drawTower(rows, kind, sim, laps, timed, sess, u, focusIdx, trackL
   for k = 1, count do
     local r = rows[k]
     local y = by + (k - 1) * rowH
+    S.hit[#S.hit + 1] = { x1 = x0, y1 = y, x2 = x0 + W, y2 = y + rowH, idx = r.i }
     if r.i == focusIdx then
       ui.drawRectFilled(vec2(x0, y), vec2(x0 + W, y + rowH), COL.bgFocus())
+    elseif S.hover == r.i then
+      ui.drawRectFilled(vec2(x0, y), vec2(x0 + W, y + rowH), rgbm(1, 1, 1, 0.10))
     end
     -- posicion
     ui.drawRectFilled(vec2(x0 + 4 * u, y + 3 * u), vec2(x0 + 34 * u, y + rowH - 3 * u), rgbm(0.95, 0.95, 0.95, 1), 3 * u)
@@ -967,6 +974,53 @@ local function drawTrackStatus(u, W)
   end
 end
 
+-- Cambiar el coche seguido (camara/HUD). Usa ac.focusCar con el indice de coche del cliente.
+local function focusCarIndex(idx)
+  if not ac.focusCar then
+    logOnce('ac.focusCar no esta disponible en esta version de CSP')
+    return
+  end
+  local ok, err = pcall(ac.focusCar, idx)
+  if not ok then logOnce('ac.focusCar fallo: ' .. tostring(err)) end
+end
+
+local function keyIndex(name)
+  local ki = ui.KeyIndex
+  local k = ki and name and ki[name]
+  if k == nil and name then logOnce('ui.KeyIndex no tiene la tecla ' .. tostring(name)) end
+  return k
+end
+
+-- Clic en una fila de la torre y teclas anterior/siguiente.
+local function handleFocusInput(rows, focusIdx)
+  S.hover = nil
+  if CONFIG.clickToFocus then
+    local mp = try(ui.mousePos)
+    if mp and mp.x and mp.x >= 0 and mp.y >= 0 then
+      for _, h in ipairs(S.hit or {}) do
+        if mp.x >= h.x1 and mp.x <= h.x2 and mp.y >= h.y1 and mp.y <= h.y2 then
+          S.hover = h.idx
+          if ui.mouseClicked(0) and h.idx ~= focusIdx then focusCarIndex(h.idx) end
+          break
+        end
+      end
+    end
+  end
+
+  local dir = 0
+  local kp, kn = keyIndex(CONFIG.keyPrevCar), keyIndex(CONFIG.keyNextCar)
+  if kp and ui.keyboardButtonPressed(kp, false) then dir = -1 end
+  if kn and ui.keyboardButtonPressed(kn, false) then dir = 1 end
+  if dir ~= 0 and #rows > 0 then
+    local cur = 0
+    for k, r in ipairs(rows) do if r.i == focusIdx then cur = k end end
+    local nxt = cur + dir
+    if cur == 0 then nxt = (dir > 0) and 1 or #rows end
+    if nxt < 1 then nxt = #rows elseif nxt > #rows then nxt = 1 end
+    focusCarIndex(rows[nxt].i)
+  end
+end
+
 local function drawHud()
   local sim = ac.getSim()
   if not sim or not S.secStart then return end
@@ -980,6 +1034,7 @@ local function drawHud()
   local focusIdx = sim.focusedCar
   drawTrackStatus(u, W)
   drawTower(rows, kind, sim, laps, timed, sess, u, focusIdx, trackLen)
+  handleFocusInput(rows, focusIdx)
 
   local focusRow
   for _, r in ipairs(rows) do if r.i == focusIdx then focusRow = r end end
