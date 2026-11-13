@@ -1,7 +1,8 @@
 --[[
   KCR Spectator HUD  (CSP online script)
   ---------------------------------------------------------------------------
-  Torre de tiempos estilo F1 para streams con slot de espectador.
+  Torre de tiempos estilo F1 para streams. Se configura por slots (CONFIG.hudSlots,
+  hiddenSlots, safetyCarSlots), sin filtros de nombre ni de modelo.
 
   * Torre a la izquierda: posicion, escudo, nombre, gap (INTERVAL / LEADER) y neumatico.
   * Cabecera: VUELTA x/total en carrera, tiempo restante en practica/qualy.
@@ -18,27 +19,20 @@
 -- CONFIGURACION
 -- ============================================================================
 local CONFIG = {
-  -- true: solo se dibuja si el cliente local es un espectador (ver isSpectatorClient)
-  onlyForSpectators = true,
-  -- Un cliente es espectador si el id de su coche contiene alguno de estos textos...
-  spectatorModelTokens = { 'spectator' },
-  -- ...o si su nombre de piloto contiene alguno de estos textos (minusculas)
-  spectatorNameTokens = { 'spectator', 'stream', 'camera' },
-  -- Lista exacta de nombres de piloto (en minusculas) que cuentan como espectador.
-  -- Util si tu slot de espectador no tiene un modelo ni un nombre reconocibles.
-  spectatorNames = {},   -- ej: { 'kcr tv', 'directo' }
-  -- Coches que no salen en la torre (id de coche contiene...)
-  hiddenModelTokens = { 'safety', 'spectator' },
+  -- SLOTS: numeros de CAR_n del entry_list.ini (empezando en 0), da igual quien los ocupe.
+  hudSlots = { 22 },            -- slots en los que se dibuja el HUD.         Ej: { 21 }
+  hiddenSlots = { 22 },         -- slots que NO salen en la torre de tiempos.  Ej: { 21 }
+  safetyCarSlots = { 20, 21 },  -- slot(s) del Safety Car: no salen en la torre y activan el estado SC
+  debugSlots = false,       -- true: dibuja un panel con tu slot y el de cada coche (para comprobar)
 
   -- Estado de pista
-  safetyCarTokens = { 'safety' },  -- id de coche que cuenta como Safety Car
   stoppedSeconds = 3,              -- un coche parado en pista tanto tiempo => amarilla en su sector
   stoppedSpeedKmh = 10,            -- por debajo de esta velocidad se considera parado
 
   defaultMode = 'interval',      -- 'interval' | 'leader'
   nameFormat = 'surname',        -- 'surname' | 'tla' (3 letras) | 'full'
-  keyToggleMode = 'F7',
-  keyToggleHud = 'F8',
+  keyToggleMode = 'F9',
+  keyToggleHud = 'F10',
 
   maxRows = 24,
   checkpoints = 300,             -- resolucion del calculo de gaps (por vuelta)
@@ -78,7 +72,6 @@ local S = {
   bestSec = {},        -- mejores sectores globales (ms)
   bestLap = nil,       -- mejor vuelta global (ms)
   map = nil,           -- false = no disponible
-  spectatorCache = { t = -100, v = false },
   tyreCache = {},
   errors = {},
 }
@@ -111,10 +104,20 @@ local function readFile(path)
   return nil
 end
 
-local function contains(str, tokens)
-  str = (str or ''):lower()
-  for _, t in ipairs(tokens) do
-    if str:find(t, 1, true) then return true end
+-- Slot del servidor (CAR_n) de un coche. Se usa car.sessionID (indice de la entry list);
+-- si no existiera en tu version de CSP se usa el indice del cliente y se avisa en el log.
+local function slotOf(car, i)
+  local s = car and car.sessionID
+  if s == nil then
+    logOnce('car.sessionID no disponible: se usa el indice del cliente como slot')
+    return i
+  end
+  return s
+end
+
+local function inList(list, v)
+  for _, x in ipairs(list) do
+    if x == v then return true end
   end
   return false
 end
@@ -481,19 +484,15 @@ local function timeLeftMs(sim, sess)
   return nil
 end
 
-local function isSpectatorClient()
-  if not CONFIG.onlyForSpectators then return true end
-  local c = S.spectatorCache
-  if S.now - c.t < 1 then return c.v end
-  local id = try(ac.getCarID, 0) or ''
-  local name = try(ac.getDriverName, 0) or ''
-  local exact = false
-  for _, n in ipairs(CONFIG.spectatorNames) do
-    if name:lower() == n:lower() then exact = true end
+-- El HUD solo se dibuja si el coche local (indice 0 del cliente) esta en uno de hudSlots.
+local function isHudClient()
+  if #CONFIG.hudSlots == 0 then
+    logOnce('CONFIG.hudSlots esta vacio: el HUD no se dibuja en ningun slot')
+    return false
   end
-  c.v = exact or contains(id, CONFIG.spectatorModelTokens) or contains(name, CONFIG.spectatorNameTokens)
-  c.t = S.now
-  return c.v
+  local car = ac.getCar(0)
+  if not car then return false end
+  return inList(CONFIG.hudSlots, slotOf(car, 0))
 end
 
 -- ============================================================================
@@ -529,11 +528,11 @@ local function updateTrack(sim, kind, laps, timed)
   for i = 0, (sim.carsCount or 0) - 1 do
     local car = ac.getCar(i)
     if car and car.isConnected then
-      local id = try(ac.getCarID, i) or ''
-      if contains(id, CONFIG.safetyCarTokens) then
+      local slot = slotOf(car, i)
+      if inList(CONFIG.safetyCarSlots, slot) then
         sc.present = true
         if not car.isInPitlane then sc.active = true end
-      elseif not contains(id, CONFIG.hiddenModelTokens) then
+      elseif not inList(CONFIG.hiddenSlots, slot) then
         local cs = getCS(i)
         local v = car.speedKmh or 0
         if cs.total and cs.total > leader then leader = cs.total end
@@ -616,7 +615,8 @@ local function buildRows(sim, kind)
     if car and car.isConnected then
       local cs = getCS(i)
       local info = getInfo(i, cs)
-      if not contains(info.carId, CONFIG.hiddenModelTokens) then
+      local slot = slotOf(car, i)
+      if not inList(CONFIG.hiddenSlots, slot) and not inList(CONFIG.safetyCarSlots, slot) then
         rows[#rows + 1] = {
           i = i, car = car, cs = cs, info = info,
           best = validTime(car.bestLapTimeMs) and car.bestLapTimeMs or nil,
@@ -994,6 +994,25 @@ local function drawHud()
   end
 end
 
+-- Panel de comprobacion (CONFIG.debugSlots): tu slot y el slot de cada coche conectado.
+local function drawSlotDebug()
+  local sim = ac.getSim()
+  if not sim then return end
+  local me = ac.getCar(0)
+  local lines = { 'SLOT DEBUG  -  tu slot: ' .. tostring(me and slotOf(me, 0)) }
+  for i = 0, (sim.carsCount or 0) - 1 do
+    local car = ac.getCar(i)
+    if car and car.isConnected then
+      lines[#lines + 1] = string.format('CAR_%s   %s', tostring(slotOf(car, i)), tostring(try(ac.getDriverName, i) or '?'))
+    end
+  end
+  local x, y = ui.windowSize().x - 340, 20
+  ui.drawRectFilled(vec2(x - 8, y - 6), vec2(x + 332, y + #lines * 20 + 6), rgbm(0, 0, 0, 0.8))
+  for k, t in ipairs(lines) do
+    ui.dwriteDrawText(t, 15, vec2(x, y + (k - 1) * 20), rgbm(1, 1, 1, 1))
+  end
+end
+
 function script.drawUI(dt)
   local ok, err = pcall(function()
     local k1 = ui.KeyIndex and ui.KeyIndex[CONFIG.keyToggleMode]
@@ -1002,7 +1021,8 @@ function script.drawUI(dt)
       S.mode = (S.mode == 'interval') and 'leader' or 'interval'
     end
     if k2 and ui.keyboardButtonPressed(k2, false) then S.hud = not S.hud end
-    if not S.hud or not isSpectatorClient() then return end
+    if CONFIG.debugSlots then pcall(drawSlotDebug) end
+    if not S.hud or not isHudClient() then return end
     local fontPushed = pcall(ui.pushDWriteFont, 'Segoe UI;Weight=Bold')
     local ok2, err2 = pcall(drawHud)
     if fontPushed then pcall(ui.popDWriteFont) end
