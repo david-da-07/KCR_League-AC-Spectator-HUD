@@ -265,21 +265,67 @@ local function driverLabel(full)
   return surname:upper()
 end
 
+local function utf8char(c)
+  if c < 0x80 then return string.char(c) end
+  if c < 0x800 then return string.char(0xC0 + math.floor(c / 64), 0x80 + c % 64) end
+  return string.char(0xE0 + math.floor(c / 4096), 0x80 + math.floor(c / 64) % 64, 0x80 + c % 64)
+end
+
+-- Decodifica los escapes de una cadena JSON (\uXXXX, \", \\, \/)
+local function jsonString(s)
+  s = s:gsub('\\u(%x%x%x%x)', function(h) return utf8char(tonumber(h, 16)) end)
+  s = s:gsub('\\(["\\/])', '%1')
+  return s
+end
+
+-- Valor de texto de un campo JSON simple ("clave": "valor"), respetando comillas escapadas
+local function jsonField(txt, key)
+  if not txt then return nil end
+  local _, e = txt:find('"' .. key .. '"%s*:%s*"')
+  if not e then return nil end
+  local i, n = e + 1, #txt
+  while i <= n do
+    local c = txt:sub(i, i)
+    if c == '\\' then i = i + 2
+    elseif c == '"' then return jsonString(txt:sub(e + 1, i - 1))
+    else i = i + 1 end
+  end
+  return nil
+end
+
+-- Ultimo recurso si no se puede leer ui_car.json: 'emka_lexus_rc_f_gt3' -> 'Emka Lexus RC F GT3'
+local function prettyId(id)
+  local out = {}
+  for tok in (id or ''):gmatch('[^_%-%s]+') do
+    if tok:match('^%a+%d+$') or #tok <= 3 then out[#out + 1] = tok:upper()
+    else out[#out + 1] = tok:sub(1, 1):upper() .. tok:sub(2):lower() end
+  end
+  return table.concat(out, ' ')
+end
+
 local function refreshInfo(i, cs)
   local carId = try(ac.getCarID, i) or ''
   local skin = try(ac.getCarSkinID, i) or ''
   local name = try(ac.getDriverName, i) or ''
-  local team
+  local skinTeam, carName
   local root = try(ac.getFolder, ac.FolderID.ContentCars)
-  if root and carId ~= '' and skin ~= '' then
-    local txt = readFile(root .. '/' .. carId .. '/skins/' .. skin .. '/ui_skin.json')
-    team = txt and txt:match('"team"%s*:%s*"(.-)"')
+  if root and carId ~= '' then
+    if skin ~= '' then
+      local txt = readFile(root .. '/' .. carId .. '/skins/' .. skin .. '/ui_skin.json')
+      skinTeam = jsonField(txt, 'team')
+    end
+    carName = jsonField(readFile(root .. '/' .. carId .. '/ui/ui_car.json'), 'name')
   end
-  if not team or team == '' then team = carId end
+  -- nombre visual del coche (ui_car.json); nunca el id crudo
+  if not carName or carName == '' then carName = prettyId(carId) end
+  if skinTeam == '' then skinTeam = nil end
+  -- clave interna para colores y escudos (CONFIG.teamBadges / teamColors): equipo del skin o id del coche
+  local team = skinTeam or carId
   local badge = CONFIG.teamBadges[team]
   if not badge and root and carId ~= '' then badge = root .. '/' .. carId .. '/ui/badge.png' end
   cs.info = {
     carId = carId, name = name, label = driverLabel(name), team = team,
+    carName = carName, skinTeam = skinTeam,
     color = CONFIG.teamColors[team] or hashColor(team), badge = badge,
   }
   cs.infoT = S.now
@@ -503,15 +549,16 @@ end
 -- ============================================================================
 -- Banderas que CSP puede presentar al cliente (sim.raceFlagType). Se resuelven por nombre
 -- y si una no existe en tu version de CSP simplemente se ignora.
+-- 4.o campo: true si la bandera afecta a TODA la pista y por tanto marca todos los sectores.
 local FLAG_TABLE = {
-  { 'SessionSuspended', 'RED FLAG',        'red' },
-  { 'PitLaneClosed',    'PIT LANE CLOSED', 'red' },
-  { 'Code60',           'CODE 60',         'yellow' },
-  { 'Caution',          'YELLOW FLAG',     'yellow' },
-  { 'SlowVehicle',      'SLOW VEHICLE',    'yellow' },
-  { 'Ambulance',        'AMBULANCE',       'yellow' },
-  { 'Finished',         'CHEQUERED FLAG',  'chequered' },
-  { 'OneLapLeft',       'FINAL LAP',       'white' },
+  { 'SessionSuspended', 'RED FLAG',        'red',       true  },
+  { 'PitLaneClosed',    'PIT LANE CLOSED', 'red',       false },
+  { 'Code60',           'CODE 60',         'yellow',    true  },
+  { 'Caution',          'YELLOW FLAG',     'yellow',    true  },
+  { 'SlowVehicle',      'SLOW VEHICLE',    'yellow',    false },
+  { 'Ambulance',        'AMBULANCE',       'yellow',    false },
+  { 'Finished',         'CHEQUERED FLAG',  'chequered', false },
+  { 'OneLapLeft',       'FINAL LAP',       'white',     false },
 }
 
 local function simFlag(sim)
@@ -567,16 +614,22 @@ local function updateTrack(sim, kind, laps, timed)
   local derivedLast = kind == 'race' and laps and laps > 1 and not timed
                       and leader >= laps - 1 and leader < laps
 
-  local T = { key = 'clear', text = 'TRACK CLEAR', color = 'green', hz = hz, sc = sc }
+  -- T.all: color con el que se marcan TODOS los sectores (bandera de pista completa).
+  -- Si es nil, solo se marcan los sectores con un coche parado (T.hz).
+  local T = { key = 'clear', text = 'TRACK CLEAR', color = 'green', hz = hz, sc = sc, all = nil }
   if f and f[3] == 'red' then
     T.key, T.text, T.color = 'red', f[2], 'red'
+    if f[4] then T.all = 'red' end
   elseif sc.active then
-    T.key, T.text, T.color = 'sc', 'SAFETY CAR', 'orange'
+    T.key, T.text, T.color, T.all = 'sc', 'SAFETY CAR', 'orange', 'orange'
   elseif (f and f[3] == 'chequered') or derivedFinish then
     T.key, T.text, T.color = 'chequered', 'CHEQUERED FLAG', 'chequered'
   elseif #hzList > 0 or (f and f[3] == 'yellow') then
+    local global = f and f[3] == 'yellow' and f[4]
     local txt = f and f[3] == 'yellow' and f[2] or 'YELLOW FLAG'
-    if #hzList > 0 then
+    if global then
+      T.all = 'yellow'   -- amarilla en toda la pista: todos los sectores, sin lista de sectores
+    elseif #hzList > 0 then
       local parts = {}
       for _, k in ipairs(hzList) do parts[#parts + 1] = 'S' .. k end
       txt = txt .. '  ' .. table.concat(parts, ' ')
@@ -794,10 +847,46 @@ local function drawTower(rows, kind, sim, laps, timed, sess, u, focusIdx, trackL
   end
 end
 
-local function panelHeader(x, y, w, u, row)
+local function textWidth(str, size)
+  local m = try(ui.measureDWriteText, str, size)
+  if m and m.x then return m.x end
+  return #str * size * 0.55
+end
+
+-- Quita el ultimo caracter UTF-8 solo si ha quedado cortado a medias
+local function trimBrokenUtf8(s)
+  local i, cont = #s, 0
+  while i > 0 and s:byte(i) >= 0x80 and s:byte(i) < 0xC0 do i = i - 1 cont = cont + 1 end
+  if i == 0 then return '' end
+  local b = s:byte(i)
+  if b < 0x80 then return s end
+  local need = (b >= 0xF0 and 3) or (b >= 0xE0 and 2) or 1
+  if cont >= need then return s end
+  return s:sub(1, i - 1)
+end
+
+-- Cabecera del panel: piloto, a su derecha (separado) el nombre visual del coche y el equipo,
+-- y el neumatico a la derecha del todo. `reserve` = espacio a la derecha que no se puede pisar.
+local function panelHeader(x, y, w, u, row, reserve)
   local tyre = tyreOf(row.i, row.car)
-  drawText(row.info.label, 20 * u, x + 14 * u, y + 6 * u, COL.white())
-  drawText(row.info.team or '', 13 * u, x + 14 * u + 10 * u + (#row.info.label * 12 * u), y + 11 * u, COL.dim())
+  local labelSize = 20 * u
+  local lw = textWidth(row.info.label, labelSize)
+  drawText(row.info.label, labelSize, x + 14 * u, y + 6 * u, COL.white())
+
+  local sub = row.info.carName or ''
+  if row.info.skinTeam and row.info.skinTeam ~= '' and row.info.skinTeam ~= sub then
+    sub = sub .. '  ·  ' .. row.info.skinTeam
+  end
+  local sx = x + 14 * u + lw + 18 * u
+  local maxW = (x + w - (reserve or 60 * u)) - sx
+  if textWidth(sub, 13 * u) > maxW then
+    -- recortar reservando sitio para los puntos suspensivos
+    while #sub > 1 and textWidth(sub .. '...', 13 * u) > maxW do
+      sub = trimBrokenUtf8(sub:sub(1, #sub - 1))
+    end
+    sub = sub .. '...'
+  end
+  if sub ~= '' and maxW > 20 * u then drawText(sub, 13 * u, sx, y + 12 * u, COL.dim()) end
   drawTyre(x + w - 24 * u, y + 20 * u, 11 * u, tyre)
 end
 
@@ -810,7 +899,7 @@ local function drawTimingPanel(row, u, W, H)
   local h = 128 * u
   local x, y = (W - w) / 2, H - h - 28 * u
   ui.drawRectFilled(vec2(x, y), vec2(x + w, y + h), COL.bg(), 6 * u)
-  panelHeader(x, y, w, u, row)
+  panelHeader(x, y, w, u, row, cs.pbLap and 170 * u or nil)   -- deja sitio al "BEST" de la derecha
 
   -- que vuelta mostramos: la actual si ya tiene sectores, si no la anterior
   local showing, isLast = cs.cur, false
@@ -949,7 +1038,13 @@ local function drawTrackStatus(u, W)
   end
   drawTextCenter(T.text, 19 * u, x + bw / 2, y + 7 * u, rgbm(fill[2][1], fill[2][2], fill[2][3], 1))
 
-  -- tira de sectores: amarillo si hay un coche parado en ese sector
+  -- tira de sectores: todos del color de la bandera si afecta a toda la pista (T.all),
+  -- si no, amarillo solo en los sectores con un coche parado
+  local ALL = {
+    yellow = rgbm(1.00, 0.82, 0.00, 1),
+    red    = rgbm(0.85, 0.07, 0.07, 1),
+    orange = rgbm(1.00, 0.50, 0.00, 1),
+  }
   local n = #S.secStart
   local gap = 4 * u
   local sw = (bw - gap * (n - 1)) / n
@@ -957,8 +1052,7 @@ local function drawTrackStatus(u, W)
     local sx = x + (k - 1) * (sw + gap)
     local hot = T.hz and T.hz[k]
     local c = hot and rgbm(1.00, 0.82, 0.00, 1) or rgbm(0.10, 0.55, 0.25, 0.9)
-    if T.key == 'sc' then c = rgbm(1.00, 0.50, 0.00, 1) end
-    if T.key == 'red' then c = rgbm(0.85, 0.07, 0.07, 1) end
+    if T.all and ALL[T.all] then c = ALL[T.all] end
     ui.drawRectFilled(vec2(sx, y + bh + 4 * u), vec2(sx + sw, y + bh + 9 * u), c, 2 * u)
   end
 
