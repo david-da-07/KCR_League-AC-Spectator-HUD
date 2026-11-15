@@ -26,7 +26,7 @@ local CONFIG = {
   debugSlots = true,       -- true: dibuja un panel con tu slot y el de cada coche (para comprobar)
 
   -- Estado de pista
-  stoppedSeconds = 3,              -- un coche parado en pista tanto tiempo => amarilla en su sector
+  stoppedSeconds = 1,              -- un coche parado en pista tanto tiempo => amarilla en su sector
   stoppedSpeedKmh = 10,            -- por debajo de esta velocidad se considera parado
 
   defaultMode = 'interval',      -- 'interval' | 'leader'
@@ -39,7 +39,7 @@ local CONFIG = {
 
   maxRows = 24,
   checkpoints = 300,             -- resolucion del calculo de gaps (por vuelta)
-  showMapInAllSessions = false,  -- mapa solo en carrera por defecto
+  statusTop = 30,
 
   -- Escudo por equipo (ruta local o URL). Si no hay, se usa ui/badge.png del coche.
   -- Ejemplo: ['Vasser Sullivan'] = 'https://tu-servidor/badges/vasser.png'
@@ -223,6 +223,7 @@ local function getCS(i)
   if not cs then
     cs = {
       times = {}, pb = {}, pbLap = nil,
+      prof = {},          -- perfil de la vuelta en curso: checkpoint -> ms desde meta (para el delta)
       cur = newLap(), last = nil,
       lapCount = nil, info = nil, infoT = -100,
     }
@@ -391,10 +392,71 @@ local function recordSector(cs, idx, ms, valid)
   cur.col[idx] = col
 end
 
+-- Tiempo de la vuelta en curso (ms). Usa el cronometro del juego y, si no existe, uno propio
+-- que arranca al pasar por meta.
+local function lapMs(cs, car)
+  local v = try(function() return car.lapTimeMs end)
+  if type(v) == 'number' and v >= 0 then return v end
+  return (S.now - (cs.lapT0 or S.now)) * 1000
+end
+
+-- Perfil de la vuelta: para cada checkpoint (0..N-1) los ms desde meta, interpolando entre frames.
+-- Al cruzar meta el perfil terminado pasa a profDone y empieza uno nuevo.
+local function recordProfile(cs, car, sp)
+  local ms = lapMs(cs, car)
+  local pos = sp * N
+  local prev = cs.profPos
+  if prev == nil then
+    cs.prof = {}
+  elseif pos < prev - N / 2 then
+    cs.profDone = cs.prof            -- el spline dio la vuelta: este perfil esta terminado
+    cs.wrapT = S.now
+    cs.prof = { [0] = 0 }
+  elseif pos > prev then
+    for c = math.floor(prev) + 1, math.floor(pos) do
+      local f = (c - prev) / (pos - prev)
+      cs.prof[c] = cs.profMs + (ms - cs.profMs) * f
+    end
+  end
+  cs.profPos, cs.profMs = pos, ms
+end
+
+-- Si la vuelta es la mejor personal y su perfil esta completo, pasa a ser la referencia del delta.
+local function promoteProfile(cs, p, total)
+  if not p then return end
+  local cnt = 0
+  for _ in pairs(p) do cnt = cnt + 1 end
+  if cnt >= N * 0.97 then
+    p[N] = total
+    cs.bestProf = p
+  end
+end
+
+-- Delta (ms) de la vuelta en curso contra la mejor personal en el mismo punto de la pista.
+local function deltaMs(cs, car)
+  local bp = cs.bestProf
+  if not bp or cs.cur.pit then return nil end
+  local pos = (car.splinePosition or 0) * N
+  local c = math.floor(pos)
+  local r0, r1 = bp[c], bp[c + 1]
+  if not r0 or not r1 then return nil end
+  return lapMs(cs, car) - (r0 + (r1 - r0) * (pos - c))
+end
+
 local function finishLap(cs, car)
   local cur = cs.cur
   local n = #S.secStart
   local total = car.previousLapTimeMs
+  -- perfil de la vuelta que acaba de terminar: si el spline ya dio la vuelta (hace menos de 5 s) es
+  -- profDone; si lapCount cambio antes que el spline, todavia es el perfil en curso
+  local profile
+  if cs.wrapT and S.now - cs.wrapT < 5 then
+    profile = cs.profDone
+  else
+    profile = cs.prof
+    cs.prof = {}
+  end
+  cs.wrapT = nil
   local lap = { s = cur.s, col = cur.col, pit = cur.pit, lapMs = nil, lapCol = nil }
   local ok = validTime(total) and not cur.pit
   if ok then
@@ -417,6 +479,7 @@ local function finishLap(cs, car)
         if not cs.pbLap or total < cs.pbLap then
           if col ~= 'purple' then col = 'green' end
           cs.pbLap = total
+          promoteProfile(cs, profile, total)
         end
         lap.lapCol = col
       else
@@ -440,6 +503,7 @@ local function updateSectors(cs, car, sp)
   if cs.secIdx == nil then
     cs.secIdx = idx
     cs.secStartT = t
+    cs.lapT0 = t
     cs.secPit = true      -- sector empezado a medias: no vale
     cs.cur.pit = true     -- vuelta incompleta: no vale
     return
@@ -454,6 +518,7 @@ local function updateSectors(cs, car, sp)
     -- cruce de meta en el spline: el ultimo sector se cierra con previousLapTimeMs
     cs.secIdx = 1
     cs.secStartT = t
+    cs.lapT0 = t
     cs.secPit = car.isInPitlane and true or false
   else
     -- salto (reset/teleport): la vuelta deja de ser valida
@@ -506,6 +571,7 @@ local function updateCar(i, car, dt)
   end
   local sp = updateProgress(cs, car, dt)
   updateSectors(cs, car, sp)
+  recordProfile(cs, car, sp)
   if cs.lapCount ~= nil and lc > cs.lapCount then finishLap(cs, car) end
   cs.lapCount = lc
   return cs
@@ -890,57 +956,84 @@ local function panelHeader(x, y, w, u, row, reserve)
   drawTyre(x + w - 24 * u, y + 20 * u, 11 * u, tyre)
 end
 
-local function drawTimingPanel(row, u, W, H)
-  local cs = row.cs
+local function fmtDelta(ms)
+  return string.format('%+.3f', ms / 1000)
+end
+
+local drawMap   -- definida mas abajo
+
+-- Panel de Practica / Qualy: mapa, S1..Sn, TOTAL y DELTA. Todo cuenta en vivo desde el paso por meta.
+local function drawTimingPanel(row, rows, u, W, H)
+  local cs, car = row.cs, row.car
   local n = #S.secStart
-  local boxes = n + 1
-  local boxW, gap = 132 * u, 10 * u
-  local w = boxes * boxW + (boxes + 1) * gap
-  local h = 128 * u
+  local boxes = n + 2                                   -- sectores + TOTAL + DELTA
+  local mapW = 190 * u
+  local boxW, gap = 118 * u, 10 * u
+  local w = mapW + boxes * boxW + (boxes + 1) * gap
+  local h = 170 * u
   local x, y = (W - w) / 2, H - h - 28 * u
   ui.drawRectFilled(vec2(x, y), vec2(x + w, y + h), COL.bg(), 6 * u)
-  panelHeader(x, y, w, u, row, cs.pbLap and 170 * u or nil)   -- deja sitio al "BEST" de la derecha
 
-  -- que vuelta mostramos: la actual si ya tiene sectores, si no la anterior
-  local showing, isLast = cs.cur, false
-  local any = false
-  for k = 1, n do if cs.cur.s[k] ~= nil then any = true end end
-  if not any and cs.last then showing, isLast = cs.last, true end
+  -- cabecera derecha: LAST (color de la ultima vuelta) y BEST
+  local right = x + w - 56 * u
+  local leftEdge = right
+  if cs.pbLap then
+    local t = 'BEST ' .. fmtLap(cs.pbLap)
+    drawTextRight(t, 13 * u, right, y + 11 * u, COL.dim())
+    leftEdge = right - textWidth(t, 13 * u) - 18 * u
+  end
+  local last = cs.last
+  if last and (last.lapMs or last.lapMsInvalid) then
+    local t = 'LAST ' .. fmtLap(last.lapMs or last.lapMsInvalid)
+    drawTextRight(t, 13 * u, leftEdge, y + 11 * u, last.lapMs and sectorColor(last.lapCol) or COL.dim())
+    leftEdge = leftEdge - textWidth(t, 13 * u) - 18 * u
+  end
+  panelHeader(x, y, w, u, row, (x + w) - leftEdge + 10 * u)
 
-  local by = y + 44 * u
+  drawMap(x + 8 * u, y + 44 * u, mapW - 16 * u, h - 52 * u, rows, row.i, u)
+
+  local by, bh = y + 46 * u, 100 * u
   for k = 1, boxes do
-    local bx = x + gap + (k - 1) * (boxW + gap)
-    ui.drawRectFilled(vec2(bx, by), vec2(bx + boxW, by + 70 * u), rgbm(0.10, 0.10, 0.14, 1), 4 * u)
-    local label, txt, col
+    local bx = x + mapW + gap + (k - 1) * (boxW + gap)
+    ui.drawRectFilled(vec2(bx, by), vec2(bx + boxW, by + bh), rgbm(0.10, 0.10, 0.14, 1), 4 * u)
+    local label, txt, col, bar
     if k <= n then
       label = 'S' .. k
-      local v = showing.s[k]
-      if v then txt = fmtSector(v) col = sectorColor(showing.col[k])
-      else txt = '--.---' col = COL.dim() end
-    else
-      label = 'TOTAL'
-      if isLast and showing.lapMs then
-        txt = fmtLap(showing.lapMs) col = sectorColor(showing.lapCol)
-      elseif isLast then
-        txt = showing.lapMsInvalid and fmtLap(showing.lapMsInvalid) or '-:--.---'
-        col = COL.dim()
+      local v = cs.cur.s[k]
+      if v then
+        txt, col = fmtSector(v), sectorColor(cs.cur.col[k])
+        bar = true
+      elseif v == nil and cs.secIdx == k and cs.secStartT then
+        -- sector en curso: cronometro en vivo (el S1 arranca al pasar por meta)
+        txt = fmtSector((S.now - cs.secStartT) * 1000)
+        col = cs.secPit and COL.dim() or COL.white()
       else
-        txt = fmtLap(row.car.lapTimeMs) col = COL.white()
+        txt, col = '--.---', COL.dim()
+      end
+    elseif k == n + 1 then
+      label = 'TOTAL'
+      txt = fmtLap(lapMs(cs, car))
+      col = cs.cur.pit and COL.dim() or COL.white()
+    else
+      label = 'DELTA'
+      local d = deltaMs(cs, car)
+      if d then
+        txt = fmtDelta(d)
+        col = d <= 0 and COL.green() or COL.brake()
+        bar = true
+      else
+        txt, col = '--', COL.dim()
       end
     end
-    drawText(label, 12 * u, bx + 8 * u, by + 4 * u, COL.dim())
-    drawTextCenter(txt, 25 * u, bx + boxW / 2, by + 28 * u, col)
-    if col ~= COL.dim() and k <= n and showing.col[k] then
-      ui.drawRectFilled(vec2(bx, by + 66 * u), vec2(bx + boxW, by + 70 * u), col, 2 * u)
+    drawText(label, 12 * u, bx + 8 * u, by + 6 * u, COL.dim())
+    drawTextCenter(txt, 27 * u, bx + boxW / 2, by + 38 * u, col)
+    if bar then
+      ui.drawRectFilled(vec2(bx, by + bh - 4 * u), vec2(bx + boxW, by + bh), col, 2 * u)
     end
-  end
-  -- mejor vuelta personal
-  if cs.pbLap then
-    drawTextRight('BEST ' .. fmtLap(cs.pbLap), 13 * u, x + w - 56 * u, y + 11 * u, COL.dim())
   end
 end
 
-local function drawMap(x, y, w, h, rows, focusIdx, u)
+drawMap = function(x, y, w, h, rows, focusIdx, u)
   if S.map == nil then S.map = loadMap() end
   local m = S.map
   if not m then return end
@@ -1020,7 +1113,7 @@ local function drawTrackStatus(u, W)
   local T = S.track
   if not T then return end
   local bw, bh = 320 * u, 38 * u
-  local x, y = (W - bw) / 2, 14 * u
+  local x, y = (W - bw) / 2, CONFIG.statusTop * u
   local fill = FLAG_FILL[T.color] or FLAG_FILL.green
   ui.drawRectFilled(vec2(x, y), vec2(x + bw, y + bh), rgbm(fill[1][1], fill[1][2], fill[1][3], fill[1][4]), 5 * u)
   if T.color == 'chequered' then
@@ -1136,10 +1229,7 @@ local function drawHud()
   if kind == 'race' then
     drawTelemetryPanel(focusRow, rows, u, W, H, true)
   else
-    drawTimingPanel(focusRow, u, W, H)
-    if CONFIG.showMapInAllSessions then
-      S.map = S.map == nil and loadMap() or S.map
-    end
+    drawTimingPanel(focusRow, rows, u, W, H)
   end
 end
 
