@@ -23,7 +23,7 @@ local CONFIG = {
   hudSlots = { 22 },            -- slots en los que se dibuja el HUD.         Ej: { 21 }
   hiddenSlots = { 22 },         -- slots que NO salen en la torre de tiempos.  Ej: { 21 }
   safetyCarSlots = { 20, 21 },  -- slot(s) del Safety Car: no salen en la torre y activan el estado SC
-  debugSlots = false,       -- true: dibuja un panel con tu slot y el de cada coche (para comprobar)
+  debugSlots = true,       -- true: dibuja un panel con tu slot y el de cada coche (para comprobar)
 
   -- Estado de pista
   stoppedSeconds = 1,              -- un coche parado en pista tanto tiempo => amarilla en su sector
@@ -59,7 +59,6 @@ local CONFIG = {
     -- V = { label = 'V', color = { ... } },              -- anade aqui compuestos propios
   },
 }
-
 -- ============================================================================
 -- UTILIDADES
 -- ============================================================================
@@ -232,10 +231,87 @@ local function getCS(i)
   return cs
 end
 
+-- ============================================================================
+-- VUELTA REAL DE CARRERA (estado de KCRLeague)
+-- El plugin difunde su estado (Idle/Grid/Formation/RollingStart/Green/...) a todos los clientes con el
+-- evento online 'KCRLeague_Server'. La vuelta de carrera se cuenta desde la bandera verde oficial,
+-- asi la vuelta de formacion y las vueltas previas del coche no cuentan.
+-- Si el evento no llega (plugin ausente, o CSP no permite dos scripts con la misma clave),
+-- se usa el contador del juego como antes.
+-- ============================================================================
+S.kcr = { state = nil, pending = {}, armed = false, started = false, ok = false }
+local KCR_FRESH = { Idle = true, Grid = true, Formation = true }
+
+pcall(function()
+  -- Misma estructura (nombres, tipos, tamanos y orden alfabetico) que KCROnlineEvents.cs / kcrleague.lua
+  ac.OnlineEvent({
+    key = ac.StructItem.key('KCRLeague_Server'),
+    ack = ac.StructItem.int32(),
+    amber = ac.StructItem.int32(),
+    code = ac.StructItem.string(24),
+    flag = ac.StructItem.string(24),
+    green = ac.StructItem.int32(),
+    gridpos = ac.StructItem.int32(),
+    heading = ac.StructItem.float(),
+    hud = ac.StructItem.int32(),
+    lap = ac.StructItem.int32(),
+    msg = ac.StructItem.string(160),
+    pdl = ac.StructItem.int32(),
+    pid = ac.StructItem.int32(),
+    ptype = ac.StructItem.string(24),
+    px = ac.StructItem.float(),
+    py = ac.StructItem.float(),
+    pz = ac.StructItem.float(),
+    red = ac.StructItem.int32(),
+    seconds = ac.StructItem.int32(),
+    seq = ac.StructItem.int32(),
+    state = ac.StructItem.string(24),
+    tint = ac.StructItem.int32(),
+    type = ac.StructItem.string(16),
+  }, function(sender, m)
+    if m and type(m.state) == 'string' and m.state ~= '' then
+      local q = S.kcr.pending
+      q[#q + 1] = m.state
+      if #q > 16 then table.remove(q, 1) end
+    end
+  end)
+  S.kcr.ok = true
+end)
+
+local function raceBase(cs)
+  local sp = cs.lastSp or 0
+  return (cs.total or 0) - sp + (sp > 0.5 and 1 or 0)   -- la meta mas cercana por delante (parrilla) o por detras
+end
+
+local function kcrOnState(ns)
+  local K = S.kcr
+  K.state = ns
+  if KCR_FRESH[ns] then
+    K.armed, K.started = true, false            -- carrera nueva: todavia no ha empezado
+    for _, cs in pairs(S.cars) do cs.rbase = nil end
+  elseif ns == 'Green' and K.armed and not K.started then
+    K.started = true                            -- bandera verde oficial: aqui empieza la vuelta 1
+    for _, cs in pairs(S.cars) do
+      if cs.total then cs.rbase = raceBase(cs) end
+    end
+  end
+end
+
+-- Progreso de carrera en vueltas (0 = linea de salida). Sin datos de KCRLeague usa el contador del juego.
+local function raceProgress(cs)
+  local K = S.kcr
+  if K.armed then
+    if not K.started then return 0 end
+    if cs.total and not cs.rbase then cs.rbase = raceBase(cs) end   -- coche que aparece tras la salida
+  end
+  return (cs.total or 0) - (cs.rbase or 0)
+end
+
 local function resetAll()
   S.cars = {}
   S.bestSec = {}
   S.bestLap = nil
+  S.kcr.state, S.kcr.armed, S.kcr.started = nil, false, false   -- 'pending' se conserva: un evento puede llegar justo al cambiar de sesion
 end
 
 local function hashColor(str)
@@ -651,7 +727,8 @@ local function updateTrack(sim, kind, laps, timed)
       elseif not inList(CONFIG.hiddenSlots, slot) then
         local cs = getCS(i)
         local v = car.speedKmh or 0
-        if cs.total and cs.total > leader then leader = cs.total end
+        local prog = raceProgress(cs)
+        if cs.total and prog > leader then leader = prog end
         if car.isInPitlane then
           cs.wasMoving = false
           cs.stopT = nil
@@ -720,6 +797,11 @@ function script.update(dt)
     for i = 0, (sim.carsCount or 0) - 1 do
       local car = ac.getCar(i)
       if car and car.isConnected then updateCar(i, car, dt) end
+    end
+    local q = S.kcr.pending
+    if #q > 0 then
+      S.kcr.pending = {}
+      for _, ns in ipairs(q) do kcrOnState(ns) end
     end
     local kind, laps, timed = sessionInfo(sim)
     updateTrack(sim, kind, laps, timed)
@@ -861,7 +943,7 @@ local function drawTower(rows, kind, sim, laps, timed, sess, u, focusIdx, trackL
   local title
   if kind == 'race' then
     if laps and laps > 0 and not timed then
-      local lead = rows[1] and rows[1].cs.total or 0
+      local lead = rows[1] and raceProgress(rows[1].cs) or 0
       local lap = math.max(1, math.floor(lead) + 1)
       if lap > laps then title = 'FINISH' else title = string.format('LAP %d/%d', lap, laps) end
     else
@@ -1238,7 +1320,9 @@ local function drawSlotDebug()
   local sim = ac.getSim()
   if not sim then return end
   local me = ac.getCar(0)
-  local lines = { 'SLOT DEBUG  -  tu slot: ' .. tostring(me and slotOf(me, 0)) }
+  local lines = { 'SLOT DEBUG  -  tu slot: ' .. tostring(me and slotOf(me, 0)),
+                  'KCR evento: ' .. (S.kcr.ok and 'registrado' or 'NO registrado')
+                  .. '  estado: ' .. tostring(S.kcr.state or '(sin datos)') }
   for i = 0, (sim.carsCount or 0) - 1 do
     local car = ac.getCar(i)
     if car and car.isConnected then
@@ -1269,3 +1353,4 @@ function script.drawUI(dt)
   end)
   if not ok then logOnce('drawUI: ' .. tostring(err)) end
 end
+
